@@ -422,12 +422,19 @@ Let's Encrypt 对同一域名 **7 天内最多签发 5 张** 证书。卸载时�
 - **兼顾隐私和速度**,使用 **`TUN 模式`** 并设置 `规则模式`, 这样就可以通过规则来选择哪些域名/IP走代理,哪些不走代理了
 
 
-### 与 Caddy / Nginx 共存（默认不占用 TCP 80/443）
+### 与 Caddy / Nginx 共存：可选 TCP 443 HTTPS 伪装
 
-本 Fork 的 `h2_domain.sh`（域名模式）和 `h2.sh`（IP 模式）默认**不再启动 Hysteria 的独立 TCP HTTPS 伪装监听**。这意味着 Caddy、Nginx 可以继续监听 TCP 80/443；Hysteria 只监听你选择的 **UDP 端口**（例如 UDP 8443 或 UDP 443）。
+安装时脚本将询问：
 
-脚本仍保留 `masquerade` 的代理响应配置，但不再生成 `listenHTTPS: :443` 和 `forceHTTPS: true`。这不会关闭 Hysteria 的 QUIC/TLS、密码认证或 Salamander 混淆。若开启 Salamander，未混淆的普通 HTTP/3 请求不能作为常规伪装网站使用。
+```text
+是否启用独立 TCP 443 HTTPS 伪装？会与 Caddy/Nginx 的 TCP 443 冲突 [y/N]:
+```
 
-**注意：**脚本仍会配置 UFW 并允许 TCP 443，放行防火墙端口并不等于占用监听端口。若使用 Caddy/Nginx，请确保 TCP 80/443 的防火墙规则与网站需要一致。运行脚本前还应检查其对 `/etc/resolv.conf` 的修改、UFW 策略和 TCP 18080 管理面板暴露方式。
+- **默认 N（推荐与 Caddy/Nginx 共存）：** 不生成 `listenHTTPS` / `forceHTTPS`，HY2 仅监听选定的 UDP 服务端口。TCP 80/443 留给已有的网站网关。
+- **选择 y：** 在未检测到 TCP 443 监听服务时，额外配置 `listenHTTPS: :443` 和 `forceHTTPS: true`。启用前请确保没有其他进程占用 TCP 443。
+- 端口检测只是安装时的前置检查，实际绑定仍应通过 `ss -tulnp` 和 `systemctl status hysteria-server` 验证。
+- 域名与非域名安装模式都支持此选项。无论是否启用 TCP 伪装，HY2 的 QUIC/TLS、认证与 Salamander 混淆配置保持不变。
+- 脚本还会管理 UFW、修改 `/etc/resolv.conf`，并安装 TCP 18080 的信息面板；请在已有业务服务器上提前检查这些副作用。
 
-若已经安装旧版本，可手动编辑 `/etc/hysteria/config.yaml` 删除 `listenHTTPS` 与 `forceHTTPS`，再运行 `systemctl restart hysteria-server`；重新运行安装脚本可能覆盖现有配置，请先备份。
+重新运行安装脚本可能覆盖现有 `/etc/hysteria/config.yaml`，升级前请先备份。
+
