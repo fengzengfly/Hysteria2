@@ -241,8 +241,7 @@ masquerade:
   proxy:
     url: https://ruanyifeng.com/
     rewriteHost: true
-  listenHTTPS: :443
-  forceHTTPS: true
+  # No TCP HTTPS listener by default: reserve ports 80/443 for Caddy/Nginx.
 EOF
 # 配置含密码和 API Token,仅允许 hysteria 用户读取
 chown hysteria:hysteria /etc/hysteria/config.yaml
