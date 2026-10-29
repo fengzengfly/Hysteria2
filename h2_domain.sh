@@ -131,7 +131,7 @@ KEY_FILE=$key_file
 EOF
     chmod 600 /etc/hysteria/panel.env
 
-    ufw allow "$PANEL_PORT"/tcp >/dev/null
+    # 管理面板端口不自动开放公网；用户需自行配置访问策略。
     systemctl daemon-reload
     systemctl enable --now h2-panel.service
 
@@ -212,17 +212,21 @@ while true; do
     esac
 done
 
-# 2. === 修改 /etc/resolv.conf 强制系统使用IPv4 进行解析 ===
-cat > /etc/resolv.conf << EOF
-nameserver 1.1.1.1
-nameserver 1.0.0.1
-nameserver 8.8.8.8
-nameserver 8.8.4.4
-EOF
-echo -e "${GREEN}------ resolv.conf配置文件修改成功 ------${NC}"
-
-# 3. === 防止系统重启修改 ===
-chattr +i /etc/resolv.conf
+# 默认保留系统 DNS；仅在用户明确选择后覆盖，且不锁定 resolv.conf。
+read -r -p "是否修改系统 DNS 为公共 DNS？可能影响现有服务 [y/N]: " CHANGE_DNS
+case "${CHANGE_DNS:-N}" in
+  y|Y|yes|YES|Yes)
+    if [ -L /etc/resolv.conf ]; then
+      echo "检测到 /etc/resolv.conf 是符号链接（由系统管理），为避免破坏 DNS，跳过修改。"
+    elif [ -f /etc/resolv.conf ] && [ ! -w /etc/resolv.conf ]; then
+      echo "DNS 配置不可写，跳过修改。"
+    else
+      cp -a /etc/resolv.conf "/etc/resolv.conf.hysteria2.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+      printf '%s\n' 'nameserver 1.1.1.1' 'nameserver 1.0.0.1' 'nameserver 8.8.8.8' 'nameserver 8.8.4.4' > /etc/resolv.conf
+      echo "DNS 已修改（未加 chattr +i 锁定）。"
+    fi ;;
+  *) echo "保留当前 DNS 配置。" ;;
+esac
 
 # 4. === 执行官方安装脚本 ===
 bash <(curl -fsSL https://get.hy2.sh/) || {
@@ -312,14 +316,20 @@ rules:
 EOF
 echo -e "${GREEN}------ 客户端配置文件创建成功! ------${NC}"
 
-# 7. === 开放防火墙端口 ===
-ensure_ufw
-ufw allow "$PORT"
-ufw allow 443/tcp
-ufw allow "$PANEL_PORT"/tcp
-ufw status
-echo -e "${GREEN}------ 防火墙配置完成! ------${NC}"
-echo "本机 ufw 已放行 SSH。若使用云厂商安全组,请放行 UDP $PORT、TCP 443、TCP $PANEL_PORT"
+# 防火墙默认保持原样；明确同意时才安装/启用 UFW 并放行端口。
+read -r -p "是否由脚本管理 UFW 防火墙？可能影响 SSH/Docker [y/N]: " MANAGE_UFW
+case "${MANAGE_UFW:-N}" in
+  y|Y|yes|YES|Yes)
+    ensure_ufw
+    ufw allow "$PORT"/udp
+    if [ "${ENABLE_TCP_MASQUERADE:-N}" = "y" ] || [ "${ENABLE_TCP_MASQUERADE:-N}" = "Y" ] || [ "${ENABLE_TCP_MASQUERADE:-N}" = "yes" ] || [ "${ENABLE_TCP_MASQUERADE:-N}" = "YES" ] || [ "${ENABLE_TCP_MASQUERADE:-N}" = "Yes" ]; then
+      ufw allow 443/tcp
+    fi
+    ufw status
+    ;;
+  *) echo "跳过 UFW 安装、启用和规则修改。请自行放行 UDP $PORT。" ;;
+esac
+echo "请确认云服务商安全组已放行 UDP $PORT；管理面板的公网访问请自行控制。"
 
 # 8. === 立即启动服务,设置开机自启 ===
 echo "正在启动 Hysteria 服务..."
