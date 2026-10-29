@@ -95,13 +95,13 @@
 ⚠️⚠️⚠️ **此模式部署前请提前将域名解析指向你的 VPS 服务器,否则会失败**
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/georgetime1970/h2/main/h2_domain.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/fengzengfly/Hysteria2/main/h2_domain.sh)
 ```
 
 ### ⚡ 非域名模式 一键部署
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/georgetime1970/h2/main/h2.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/fengzengfly/Hysteria2/main/h2.sh)
 ```
 
 ---
@@ -112,7 +112,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/georgetime1970/h2/main/h2.sh
 - 脚本来源于本项目的[fail2ban.sh](https://github.com/georgetime1970/h2/blob/main/fail2ban.sh) 文件,已开源,请放心食用
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/georgetime1970/h2/main/fail2ban.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/fengzengfly/Hysteria2/main/fail2ban.sh)
 ```
 
 ---
@@ -127,7 +127,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/georgetime1970/h2/main/fail2
 - 云厂商安全组请到控制台自行关掉对应端口
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/georgetime1970/h2/main/uninstall.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/fengzengfly/Hysteria2/main/uninstall.sh)
 ```
 
 ---
