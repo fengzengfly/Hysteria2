@@ -142,6 +142,226 @@ while true; do
     break
 done
 
+# 可选的独立 TCP HTTPS 伪装监听；默认关闭，避免占用 Caddy/Nginx 的 443 端口。
+TCP_MASQUERADE_CONFIG=""
+while true; do
+    read -r -p "是否启用独立 TCP 443 HTTPS 伪装？会与 Caddy/Nginx 的 TCP 443 冲突 [y/N]: " ENABLE_TCP_MASQUERADE
+    case "${ENABLE_TCP_MASQUERADE:-N}" in
+        y|Y|yes|YES|Yes)
+            if ss -H -ltn '( sport = :443 )' 2>/dev/null | grep -q .; then
+                echo -e "${RED}检测到 TCP 443 已有监听服务，请先释放端口，或选择不启用 TCP 伪装。${NC}"
+                continue
+            fi
+            TCP_MASQUERADE_CONFIG=
+PUBLIC_IP=$(curl -s --max-time 5 https://ifconfig.me \
+  || curl -s --max-time 5 https://api.ipify.org \
+  || curl -s --max-time 5 https://ipinfo.io/ip \
+  || curl -s --max-time 5 https://checkip.amazonaws.com)
+if [ -z "$PUBLIC_IP" ]; then
+    echo -e "${RED}无法获取公网 IP,无法签发自签证书,请检查网络后重试${NC}"
+    exit 1
+fi
+
+# 3. === 修改 /etc/resolv.conf 强制系统使用IPv4 进行解析 ===
+cat > /etc/resolv.conf << EOF
+nameserver 1.1.1.1
+nameserver 1.0.0.1
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+EOF
+echo -e "${GREEN}------ resolv.conf配置文件修改成功 ------${NC}"
+
+# 4. === 防止系统重启修改 ===
+chattr +i /etc/resolv.conf
+
+# 5. === 执行官方安装脚本 ===
+bash <(curl -fsSL https://get.hy2.sh/) || {
+    echo -e "${RED}Hysteria 安装失败，请检查网络连接${NC}"
+    exit 1
+}
+echo -e "${GREEN}Hysteria 2 服务已成功安装,进入配置${NC}"
+
+# 6. === 创建证书目录 ===
+mkdir -p /etc/hysteria
+# 7. === 生成365天的自签名证书 ===
+openssl req -x509 -newkey rsa:2048 -keyout /etc/hysteria/self-signed.key -out /etc/hysteria/self-signed.crt -days 365 -nodes -subj "/CN=$PUBLIC_IP" -addext "subjectAltName=IP:$PUBLIC_IP" || {
+    echo -e "${RED}证书生成失败${NC}"
+    exit 1
+}
+echo -e "${GREEN}自签证书创建成功${NC}"
+
+# 8. === 创建服务端配置文件 ===
+cat > /etc/hysteria/config.yaml << EOF
+listen: :$PORT
+
+tls:
+  cert: /etc/hysteria/self-signed.crt
+  key: /etc/hysteria/self-signed.key
+
+auth:
+  type: password
+  password: $(yaml_quote "$PASSWORD")
+
+trafficStats:
+  listen: 127.0.0.1:9999
+  secret: $(yaml_quote "$PASSWORD")
+
+obfs:
+  type: salamander
+  salamander:
+    password: $(yaml_quote "$PASSWORD")
+
+masquerade:
+  type: proxy
+  proxy:
+    url: https://ruanyifeng.com/
+    rewriteHost: true
+${TCP_MASQUERADE_CONFIG}
+EOF
+# Hysteria 以 hysteria 用户运行,私钥和配置必须归该用户所有
+chown hysteria:hysteria /etc/hysteria/self-signed.crt /etc/hysteria/self-signed.key /etc/hysteria/config.yaml
+chmod 644 /etc/hysteria/self-signed.crt
+chmod 600 /etc/hysteria/self-signed.key /etc/hysteria/config.yaml
+echo -e "${GREEN}服务端配置文件创建成功${NC}"
+
+# 9. === 创建客户端配置文件 ===
+cat > /etc/hysteria/h2.yaml << EOF
+proxies:
+  - name: $PUBLIC_IP
+    type: hysteria2
+    server: $PUBLIC_IP
+    port: $PORT
+    password: $(yaml_quote "$PASSWORD")
+    sni: $PUBLIC_IP
+    obfs: salamander
+    obfs-password: $(yaml_quote "$PASSWORD")
+    # 自签证书手机没法安装,订阅默认跳过校验;电脑装了证书可改成 false
+    skip-cert-verify: true
+
+proxy-groups:
+  - name: H2
+    type: select
+    proxies:
+      - $PUBLIC_IP
+
+rules:
+ # 国内流量直连
+  - DOMAIN-SUFFIX,cn,DIRECT
+  - DOMAIN-SUFFIX,baidu.com,DIRECT
+  - DOMAIN-SUFFIX,qq.com,DIRECT
+  - DOMAIN-SUFFIX,weibo.com,DIRECT
+  - DOMAIN-SUFFIX,alibaba.com,DIRECT
+  - DOMAIN-SUFFIX,tmall.com,DIRECT
+  - DOMAIN-SUFFIX,taobao.com,DIRECT
+  - DOMAIN-SUFFIX,163.com,DIRECT
+  - DOMAIN-SUFFIX,360.cn,DIRECT
+  - DOMAIN-SUFFIX,gov.cn,DIRECT
+  - DOMAIN-SUFFIX,edu.cn,DIRECT
+  - DOMAIN-SUFFIX,dune.com,DIRECT
+
+  # 常见国内 IP 地址直连
+  - GEOIP,CN,DIRECT
+
+  # 国外流量通过代理
+  - MATCH,H2
+EOF
+echo -e "${GREEN}客户端配置文件创建成功${NC}"
+
+# 10. === 开放防火墙端口 ===
+ensure_ufw
+ufw allow "$PORT"
+ufw allow 443/tcp
+ufw allow "$PANEL_PORT"/tcp
+ufw status
+echo -e "${GREEN}防火墙完成！${NC}"
+echo "本机 ufw 已放行 SSH。若使用云厂商安全组,请放行 UDP $PORT、TCP 443、TCP $PANEL_PORT"
+
+# 11. === 启动服务并设置开机自启 ===
+echo "正在启动 Hysteria 服务..."
+systemctl start hysteria-server.service
+systemctl enable hysteria-server.service
+
+# 12. === 检查服务状态,最多等待约15秒 ===
+echo "检查服务状态..."
+HY2_OK=false
+for i in $(seq 1 15); do
+    if systemctl is-active --quiet hysteria-server.service; then
+        HY2_OK=true
+        break
+    fi
+    if systemctl is-failed --quiet hysteria-server.service; then
+        break
+    fi
+    sleep 1
+done
+
+if [ "$HY2_OK" = true ]; then
+    echo -e "${GREEN}Hysteria 服务运行正常${NC}"
+    systemctl status hysteria-server.service --no-pager | head -n 10
+else
+    echo -e "${RED}Hysteria 服务启动失败,最近错误日志如下:${NC}"
+    journalctl -u hysteria-server.service -n 20 --no-pager
+    echo -e "${RED}请根据以上错误排查,修复后执行: systemctl restart hysteria-server.service${NC}"
+fi
+
+# 13. === 选装 fail2ban,防止 SSH 端口被暴力破解 ===
+read -p "是否选装 fail2ban 防 SSH 爆破? 推荐新服务器安装 [Y/n]: " INSTALL_FAIL2BAN
+if [[ -z "$INSTALL_FAIL2BAN" || "$INSTALL_FAIL2BAN" =~ ^[Yy]$ ]]; then
+    bash <(curl -fsSL https://raw.githubusercontent.com/georgetime1970/h2/main/fail2ban.sh) || {
+        echo -e "${RED}fail2ban 安装失败,可稍后手动执行:${NC}"
+        echo "bash <(curl -fsSL https://raw.githubusercontent.com/georgetime1970/h2/main/fail2ban.sh)"
+    }
+fi
+
+# 14. === 安装常驻信息面板 ===
+PANEL_URL=""
+SUB_URL=""
+install_h2_panel "$PUBLIC_IP" || true
+
+# 15. === 显示最终信息 ===
+if [ "$HY2_OK" = true ]; then
+    echo -e "${GREEN}Hysteria 2 安装和配置完成！${NC}"
+else
+    echo -e "${RED}Hysteria 2 未成功运行,请先根据上方日志排查${NC}"
+fi
+echo "--------------------------------------------"
+echo -e "🌐 服务器IP:  ${GREEN}$PUBLIC_IP${NC}"
+echo -e "🚪 使用端口:  ${GREEN}$PORT${NC}"
+echo -e "🔐 连接密码:  ${GREEN}$PASSWORD${NC}"
+echo -e "📄 服务端配置:  /etc/hysteria/config.yaml"
+echo -e "📄 客户端配置:  /etc/hysteria/h2.yaml"
+echo -e "🔏 证书路径:  /etc/hysteria/self-signed.crt"
+[ -n "$PANEL_URL" ] && echo -e "🖥️ 信息面板:  ${GREEN}$PANEL_URL${NC}"
+[ -n "$SUB_URL" ] && echo -e "📥 订阅链接:  ${GREEN}$SUB_URL${NC}"
+echo "--------------------------------------------"
+echo "云厂商安全组请放行: UDP $PORT、TCP 443、TCP $PANEL_PORT"
+echo
+echo -e "${RED}请仔细阅读以下证书的客户端配置流程！${NC}"
+echo -e "${GREEN}1.将下面的证书内容复制到客户端设备上，保存为 self-signed.crt 文件。${NC}"
+echo -e "${GREEN}2.Windows 客户端,双击 self-signed.crt 文件 → “安装证书” → 选择“本地计算机” → 选择“将所有的证书都放入下列存储” →  存储到 “受信任的根证书颁发机构”。${NC}"
+echo -e "${GREEN}3.订阅默认 skip-cert-verify: true (不验证证书),手机可直接用。电脑若已安装下方证书,可改成 false,以便识别假服务器。${NC}"
+echo "💖💖💖💖💖💖💖💖💖💖💖💖💖💖💖💖💖💖💖💖"
+echo -e 复制以下证书内容到电脑上保存为 self-signed.crt 文件:
+cat /etc/hysteria/self-signed.crt
+echo "💖💖💖💖💖💖💖💖💖💖💖💖💖💖💖💖💖💖💖💖"
+echo
+read -p "需要显示客户端具体配置内容,请按回车 或执行 cat /etc/hysteria/h2.yaml 命令查看💕"
+echo "---------------------------------------------------"
+echo -e 复制以下配置内容到电脑上保存为 h2.yaml 文件然后导入客户端:
+cat /etc/hysteria/h2.yaml
+echo "---------------------------------------------------"
+  listenHTTPS: :443\\n  forceHTTPS: true'
+            echo -e "${GREEN}已启用 TCP 443 HTTPS 伪装。${NC}"
+            break
+            ;;
+        n|N|no|NO|No|"")
+            echo "已禁用独立 TCP HTTPS 伪装，TCP 80/443 可留给 Caddy/Nginx。"
+            break
+            ;;
+        *) echo "请输入 y 或 n（默认 n）。" ;;
+    esac
+done
+
 # 2. === 获取公网 IP ===
 PUBLIC_IP=$(curl -s --max-time 5 https://ifconfig.me \
   || curl -s --max-time 5 https://api.ipify.org \
