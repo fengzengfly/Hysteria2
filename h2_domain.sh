@@ -190,6 +190,211 @@ while true; do
     break
 done
 
+# 可选的独立 TCP HTTPS 伪装监听；默认关闭，避免占用 Caddy/Nginx 的 443 端口。
+TCP_MASQUERADE_CONFIG=""
+while true; do
+    read -r -p "是否启用独立 TCP 443 HTTPS 伪装？会与 Caddy/Nginx 的 TCP 443 冲突 [y/N]: " ENABLE_TCP_MASQUERADE
+    case "${ENABLE_TCP_MASQUERADE:-N}" in
+        y|Y|yes|YES|Yes)
+            if ss -H -ltn '( sport = :443 )' 2>/dev/null | grep -q .; then
+                echo -e "${RED}检测到 TCP 443 已有监听服务，请先释放端口，或选择不启用 TCP 伪装。${NC}"
+                continue
+            fi
+            TCP_MASQUERADE_CONFIG=
+cat > /etc/resolv.conf << EOF
+nameserver 1.1.1.1
+nameserver 1.0.0.1
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+EOF
+echo -e "${GREEN}------ resolv.conf配置文件修改成功 ------${NC}"
+
+# 3. === 防止系统重启修改 ===
+chattr +i /etc/resolv.conf
+
+# 4. === 执行官方安装脚本 ===
+bash <(curl -fsSL https://get.hy2.sh/) || {
+    echo -e "${RED}Hysteria 安装失败,请检查网络连接${NC}"
+    exit 1
+}
+echo -e "${GREEN}------ Hysteria 2 核心已成功安装! ------${NC}"
+
+# 5. === 创建服务端配置文件,acme的API权限要选择 DNS 读写 ===
+cat > /etc/hysteria/config.yaml << EOF
+listen: :$PORT
+
+acme:
+  domains:
+    - $(yaml_quote "$DOMAIN")
+  email: admin@$DOMAIN
+  type: dns
+  dns:
+    name: cloudflare
+    config:
+      cloudflare_api_token: $(yaml_quote "$CLOUDFLAREAPI")
+
+auth:
+  type: password
+  password: $(yaml_quote "$PASSWORD")
+
+trafficStats:
+  listen: 127.0.0.1:9999
+  secret: $(yaml_quote "$PASSWORD")
+
+obfs:
+  type: salamander
+  salamander:
+    password: $(yaml_quote "$PASSWORD")
+
+masquerade:
+  type: proxy
+  proxy:
+    url: https://ruanyifeng.com/
+    rewriteHost: true
+${TCP_MASQUERADE_CONFIG}
+EOF
+# 配置含密码和 API Token,仅允许 hysteria 用户读取
+chown hysteria:hysteria /etc/hysteria/config.yaml
+chmod 600 /etc/hysteria/config.yaml
+echo -e "${GREEN}------ 服务端配置文件创建成功! ------${NC}"
+
+# 6. === 创建客户端配置文件 ===
+cat > /etc/hysteria/h2.yaml << EOF
+proxies:
+  - name: $DOMAIN
+    type: hysteria2
+    server: $DOMAIN
+    port: $PORT
+    password: $(yaml_quote "$PASSWORD")
+    sni: $DOMAIN
+    obfs: salamander
+    obfs-password: $(yaml_quote "$PASSWORD")
+    skip-cert-verify: false
+
+proxy-groups:
+  - name: H2
+    type: select
+    proxies:
+      - $DOMAIN
+
+rules:
+ # 国内流量直连
+  - DOMAIN-SUFFIX,cn,DIRECT
+  - DOMAIN-SUFFIX,baidu.com,DIRECT
+  - DOMAIN-SUFFIX,qq.com,DIRECT
+  - DOMAIN-SUFFIX,weibo.com,DIRECT
+  - DOMAIN-SUFFIX,alibaba.com,DIRECT
+  - DOMAIN-SUFFIX,tmall.com,DIRECT
+  - DOMAIN-SUFFIX,taobao.com,DIRECT
+  - DOMAIN-SUFFIX,163.com,DIRECT
+  - DOMAIN-SUFFIX,360.cn,DIRECT
+  - DOMAIN-SUFFIX,gov.cn,DIRECT
+  - DOMAIN-SUFFIX,edu.cn,DIRECT
+  - DOMAIN-SUFFIX,dune.com,DIRECT
+
+  # 常见国内 IP 地址直连
+  - GEOIP,CN,DIRECT
+
+  # 国外流量通过代理
+  - MATCH,H2
+EOF
+echo -e "${GREEN}------ 客户端配置文件创建成功! ------${NC}"
+
+# 7. === 开放防火墙端口 ===
+ensure_ufw
+ufw allow "$PORT"
+ufw allow 443/tcp
+ufw allow "$PANEL_PORT"/tcp
+ufw status
+echo -e "${GREEN}------ 防火墙配置完成! ------${NC}"
+echo "本机 ufw 已放行 SSH。若使用云厂商安全组,请放行 UDP $PORT、TCP 443、TCP $PANEL_PORT"
+
+# 8. === 立即启动服务,设置开机自启 ===
+echo "正在启动 Hysteria 服务..."
+systemctl start hysteria-server.service
+systemctl enable hysteria-server.service
+
+# 9. === 检查服务状态,域名模式申请证书可能较慢,最多等待约90秒 ===
+echo "检查服务状态..."
+HY2_OK=false
+for i in $(seq 1 45); do
+    if systemctl is-active --quiet hysteria-server.service; then
+        HY2_OK=true
+        break
+    fi
+    if systemctl is-failed --quiet hysteria-server.service; then
+        break
+    fi
+    sleep 2
+done
+
+if [ "$HY2_OK" = true ]; then
+    echo -e "${GREEN}Hysteria 服务运行正常${NC}"
+    systemctl status hysteria-server.service --no-pager | head -n 10
+else
+    echo -e "${RED}Hysteria 服务启动失败,最近错误日志如下:${NC}"
+    journalctl -u hysteria-server.service -n 20 --no-pager
+    echo -e "${RED}请根据以上错误排查,修复后执行: systemctl restart hysteria-server.service${NC}"
+fi
+
+# 10. === 选装 fail2ban,防止 SSH 端口被暴力破解 ===
+read -p "是否选装 fail2ban 防 SSH 爆破? 推荐新服务器安装 [Y/n]: " INSTALL_FAIL2BAN
+if [[ -z "$INSTALL_FAIL2BAN" || "$INSTALL_FAIL2BAN" =~ ^[Yy]$ ]]; then
+    bash <(curl -fsSL https://raw.githubusercontent.com/georgetime1970/h2/main/fail2ban.sh) || {
+        echo -e "${RED}fail2ban 安装失败,可稍后手动执行:${NC}"
+        echo "bash <(curl -fsSL https://raw.githubusercontent.com/georgetime1970/h2/main/fail2ban.sh)"
+    }
+fi
+
+# 11. === 获取公网 IP ===
+PUBLIC_IP=$(curl -s --max-time 5 https://ifconfig.me \
+  || curl -s --max-time 5 https://api.ipify.org \
+  || curl -s --max-time 5 https://ipinfo.io/ip \
+  || curl -s --max-time 5 https://checkip.amazonaws.com)
+if [ -z "$PUBLIC_IP" ]; then
+    PUBLIC_IP="(未能自动获取,请自行查看)"
+fi
+
+# 12. === 安装常驻信息面板 ===
+PANEL_URL=""
+SUB_URL=""
+install_h2_panel "$DOMAIN" 1 || true
+
+# 13. === 显示最终信息 ===
+if [ "$HY2_OK" = true ]; then
+    echo -e "${GREEN}------ Hysteria 2 安装和配置完成! ------${NC}"
+else
+    echo -e "${RED}------ Hysteria 2 未成功运行,请先根据上方日志排查 ------${NC}"
+fi
+echo "--------------------------------------------"
+echo -e "📇 您的域名:  ${GREEN}$DOMAIN${NC}"
+echo -e "🌐 服务器IP:  ${GREEN}$PUBLIC_IP${NC}"
+echo -e "🚪 使用端口:  ${GREEN}$PORT${NC}"
+echo -e "🔐 连接密码:  ${GREEN}$PASSWORD${NC}"
+echo -e "📄 服务端配置:  /etc/hysteria/config.yaml"
+echo -e "📄 客户端配置:  /etc/hysteria/h2.yaml"
+[ -n "$PANEL_URL" ] && echo -e "🖥️ 信息面板:  ${GREEN}$PANEL_URL${NC}"
+[ -n "$SUB_URL" ] && echo -e "📥 订阅链接:  ${GREEN}$SUB_URL${NC}"
+echo "--------------------------------------------"
+echo "云厂商安全组请放行: UDP $PORT、TCP 443、TCP $PANEL_PORT"
+echo
+read -p "需要显示客户端具体配置内容,请按回车💕"
+echo "---------------------------------------------------"
+echo -e 复制以下配置内容到电脑上保存为 h2.yaml 文件然后导入客户端:
+cat /etc/hysteria/h2.yaml
+echo "---------------------------------------------------"
+  listenHTTPS: :443\\n  forceHTTPS: true'
+            echo -e "${GREEN}已启用 TCP 443 HTTPS 伪装。${NC}"
+            break
+            ;;
+        n|N|no|NO|No|"")
+            echo "已禁用独立 TCP HTTPS 伪装，TCP 80/443 可留给 Caddy/Nginx。"
+            break
+            ;;
+        *) echo "请输入 y 或 n（默认 n）。" ;;
+    esac
+done
+
 # 2. === 修改 /etc/resolv.conf 强制系统使用IPv4 进行解析 ===
 cat > /etc/resolv.conf << EOF
 nameserver 1.1.1.1
